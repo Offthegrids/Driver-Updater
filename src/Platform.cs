@@ -8,6 +8,8 @@ using System.Linq;
 using System.Management;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -25,6 +27,41 @@ namespace DriverUpdater
         public static readonly string LastScanFile = Path.Combine(StateDir, "last-scan.json");
         public static readonly string CatalogCacheFile = Path.Combine(StateDir, "catalog-cache.json");
         public static readonly string OldLastScanFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DriverUpdater", "last-scan.json");
+
+        /// <summary>
+        /// Every account may create folders in ProgramData, so a standard user could otherwise create this folder
+        /// (or files in it) before the app does and plant data the app - running as administrator - trusts.
+        /// Makes Administrators the owner, gives write access only to SYSTEM and Administrators, and resets
+        /// the files inside to those rights.
+        /// </summary>
+        public static void SecureStateDir()
+        {
+            try
+            {
+                var dir = new DirectoryInfo(StateDir);
+                if (!dir.Exists) dir.Create();
+                var admins = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+                var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+                var users = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+                var all = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+                var sec = new DirectorySecurity();
+                sec.SetOwner(admins);
+                sec.SetAccessRuleProtection(true, false);
+                sec.AddAccessRule(new FileSystemAccessRule(system, FileSystemRights.FullControl, all, PropagationFlags.None, AccessControlType.Allow));
+                sec.AddAccessRule(new FileSystemAccessRule(admins, FileSystemRights.FullControl, all, PropagationFlags.None, AccessControlType.Allow));
+                sec.AddAccessRule(new FileSystemAccessRule(users, FileSystemRights.ReadAndExecute, all, PropagationFlags.None, AccessControlType.Allow));
+                dir.SetAccessControl(sec);
+                foreach (var sub in dir.GetDirectories("*", SearchOption.AllDirectories))
+                {
+                    var ds = new DirectorySecurity(); ds.SetOwner(admins); ds.SetAccessRuleProtection(false, false); sub.SetAccessControl(ds);
+                }
+                foreach (var f in dir.GetFiles("*", SearchOption.AllDirectories))
+                {
+                    var fs = new FileSecurity(); fs.SetOwner(admins); fs.SetAccessRuleProtection(false, false); f.SetAccessControl(fs);
+                }
+            }
+            catch (Exception ex) { Log.Write("Couldn't secure " + StateDir + ": " + ex.Message); }
+        }
     }
 
     /// <summary>Small app preferences (appearance...), kept with the app's other saved data.</summary>
@@ -66,6 +103,7 @@ namespace DriverUpdater
     public static class Log
     {
         static readonly object Gate = new object();
+        static bool trimmed;
         public static void Write(string message)
         {
             try
@@ -73,10 +111,22 @@ namespace DriverUpdater
                 lock (Gate)
                 {
                     Directory.CreateDirectory(Paths.WorkDir);
+                    if (!trimmed) { trimmed = true; Trim(); }
                     File.AppendAllText(Paths.LogFile, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + message + Environment.NewLine, Encoding.UTF8);
                 }
             }
             catch { }
+        }
+
+        /// <summary>Once per run: a log over 2 MB keeps only its last 1 MB.</summary>
+        static void Trim()
+        {
+            var f = new FileInfo(Paths.LogFile);
+            if (!f.Exists || f.Length <= 2 * 1024 * 1024) return;
+            byte[] tail;
+            using (var fs = f.OpenRead()) { fs.Seek(-1024 * 1024, SeekOrigin.End); tail = new byte[1024 * 1024]; fs.Read(tail, 0, tail.Length); }
+            int nl = Array.IndexOf(tail, (byte)'\n');
+            File.WriteAllBytes(Paths.LogFile, tail.Skip(nl + 1).ToArray());
         }
     }
 
@@ -266,11 +316,20 @@ namespace DriverUpdater
             return list;
         }
 
-        /// <summary>Downloads and installs one update by ID. Returns (ok, message, rebootNeeded).</summary>
-        public static Tuple<bool, string, bool> Install(string updateId)
+        /// <summary>One Windows Update search shared by all installs of a run (each search takes 10-60 seconds).</summary>
+        public class Batch { internal dynamic Session, Updates; }
+
+        public static Batch Prepare()
         {
             dynamic session = NewSession();
-            dynamic updates = Search(session);
+            return new Batch { Session = session, Updates = Search(session) };
+        }
+
+        /// <summary>Downloads and installs one update by ID. Returns (ok, message, rebootNeeded).</summary>
+        public static Tuple<bool, string, bool> Install(Batch batch, string updateId)
+        {
+            dynamic session = batch.Session;
+            dynamic updates = batch.Updates;
             dynamic target = null;
             int n = updates.Count;
             for (int i = 0; i < n; i++)
@@ -398,7 +457,7 @@ namespace DriverUpdater
             catch (Exception ex) { Log.Write("Could not save catalog cache: " + ex.Message); }
         }
 
-        int refusedInARow, oddInARow;
+        int refusedInARow, oddInARow, failedInARow;
         DateTime busyUntil = BusyUntil;
 
         /// <summary>
@@ -434,8 +493,15 @@ namespace DriverUpdater
                 using (var wc = NewClient()) html = wc.DownloadString(Base + "/Search.aspx?q=" + Uri.EscapeDataString(query));
             }
             catch (Exception ex) { Log.Write("Catalog request failed for '" + query + "': " + ex.Message); }
-            var rows = html == null ? null : Catalog.Parse(html);
-            if (rows == null && html != null && !html.Contains("Too many search requests") && ++oddInARow < 3)
+            if (html == null)
+            {
+                // no answer at all (no connection): not checked, but this is not Microsoft slowing us down, so no long pause
+                if (++failedInARow >= 2) { Blocked = true; Log.Write("No connection to Microsoft's catalog - skipping it for this scan."); }
+                return null;
+            }
+            failedInARow = 0;
+            var rows = Catalog.Parse(html);
+            if (rows == null && !html.Contains("Too many search requests") && ++oddInARow < 3)
             {
                 // an error page for this one search (not Microsoft slowing us down): treat it as "nothing found"
                 Log.Write("Catalog couldn't search for '" + query + "' - skipped.");
@@ -467,7 +533,7 @@ namespace DriverUpdater
                 Status("Microsoft asked us to slow down – trying the remaining drivers in " + s + " s...");
                 Thread.Sleep(1000);
             }
-            Blocked = false; refusedInARow = 0; pace = 3000;
+            Blocked = false; refusedInARow = 0; failedInARow = 0; pace = 3000;
         }
 
         /// <summary>Best driver for a device. checkedOk=false means Microsoft refused the search.</summary>
@@ -530,18 +596,11 @@ namespace DriverUpdater
             return extract;
         }
 
-        public static Tuple<bool, string, bool> Install(string guid, string name, Action<string> status)
+        public static InstallOutcome Install(string guid, string name, Action<string> status)
         {
             string extract = Prefetch(guid, name, status);
             status("Installing: " + name);
-            int code = Sys.Run(Sys.SystemTool("pnputil.exe"), "/add-driver \"" + Path.Combine(extract, "*.inf") + "\" /subdirs /install");
-            switch (code)
-            {
-                case 0: return Tuple.Create(true, "Installed", false);
-                case 3010: return Tuple.Create(true, "Installed", true);
-                case 259: return Tuple.Create(false, "Windows kept current driver", false);
-                default: return Tuple.Create(false, "Failed (pnputil " + code + ")", false);
-            }
+            return VendorNet.PnputilOutcome(Sys.Run(Sys.SystemTool("pnputil.exe"), "/add-driver \"" + Path.Combine(extract, "*.inf") + "\" /subdirs /install"));
         }
     }
 
@@ -702,6 +761,24 @@ namespace DriverUpdater
     public static class InboxRestore
     {
         public class Result { public bool Ok, Reboot; public string Message = "", NowProvider = ""; }
+
+        /// <summary>Other devices that use the same driver package - removing it switches them to Windows' drivers too.</summary>
+        public static List<string> OtherDevicesUsingDriver(string deviceId)
+        {
+            var names = new List<string>();
+            string q = deviceId.Replace("\\", "\\\\").Replace("'", "\\'");
+            string inf = Sys.Wmi1("SELECT InfName FROM Win32_PnPSignedDriver WHERE DeviceID = '" + q + "'", "InfName");
+            if (!inf.StartsWith("oem", StringComparison.OrdinalIgnoreCase)) return names;
+            try
+            {
+                using (var s = new ManagementObjectSearcher("SELECT DeviceID, DeviceName FROM Win32_PnPSignedDriver WHERE InfName = '" + inf.Replace("'", "") + "'"))
+                    foreach (ManagementObject o in s.Get())
+                        if (!string.Equals(o["DeviceID"] as string, deviceId, StringComparison.OrdinalIgnoreCase))
+                            names.Add((o["DeviceName"] as string) ?? (o["DeviceID"] as string) ?? "");
+            }
+            catch (Exception ex) { Log.Write("Couldn't list devices using " + inf + ": " + ex.Message); }
+            return names.Where(n => n.Length > 0).Distinct().ToList();
+        }
 
         public static Result Run(string deviceId)
         {
@@ -888,17 +965,8 @@ namespace DriverUpdater
                 }
             }
             var len = new FileInfo(file).Length;
-            if (r.Size > 0 && len != r.Size) throw new InvalidOperationException("The download is incomplete (" + len + " of " + r.Size + " bytes)");
-            if (!string.IsNullOrEmpty(r.Digest) && r.Digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
-            {
-                string want = r.Digest.Substring(7).Trim().ToLowerInvariant(), have;
-                using (var sha = System.Security.Cryptography.SHA256.Create())
-                using (var fs = File.OpenRead(file)) have = BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
-                if (have != want) throw new InvalidOperationException("The download doesn't match the published file (fingerprint mismatch)");
-            }
-            var fv = FileVersionInfo.GetVersionInfo(file);
-            if (!AppRelease.IsNewer(fv.FileVersion ?? "", App.Version) || !(fv.FileVersion ?? "").StartsWith(r.Version))
-                throw new InvalidOperationException("The downloaded file isn't Driver Updater " + r.Version);
+            string why = AppRelease.Verify(file, r, App.Version, FileVersionInfo.GetVersionInfo(file).FileVersion ?? "");
+            if (why != null) throw new InvalidOperationException(why);
             Log.Write("Downloaded update " + r.Version + " (" + len + " bytes" + (string.IsNullOrEmpty(r.Digest) ? ", no published fingerprint" : ", fingerprint OK") + ")");
             return file;
         }

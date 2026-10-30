@@ -10,12 +10,13 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DriverUpdater
 {
     public class InstallOutcome
     {
-        public bool Ok, Reboot, Opened, Kept, NotForDevice;
+        public bool Ok, Reboot, Kept, NotForDevice;
         public string Message;
         public static InstallOutcome Of(bool ok, string msg, bool reboot = false) { return new InstallOutcome { Ok = ok, Message = msg, Reboot = reboot }; }
     }
@@ -439,21 +440,19 @@ namespace DriverUpdater
                 status("Unpacking " + job.Source + " package...");
                 string extract = Path.Combine(dir, "extracted");
                 Unzip(file, extract);
+                // some makers put the driver in a second .zip inside the package
+                if (Directory.GetFiles(extract, "*.inf", SearchOption.AllDirectories).Length == 0)
+                    foreach (var inner in Directory.GetFiles(extract, "*.zip", SearchOption.AllDirectories).Take(5))
+                        try { Unzip(inner, Path.Combine(Path.GetDirectoryName(inner), Path.GetFileNameWithoutExtension(inner))); } catch (Exception ex) { Log.Write("Couldn't unpack " + inner + ": " + ex.Message); }
+                if (job.Source == "ASUS") LogPackage(extract);
                 if (Directory.GetFiles(extract, "*.inf", SearchOption.AllDirectories).Length > 0)
                 {
                     status("Installing: " + job.Name);
-                    int code = Sys.Run(Sys.SystemTool("pnputil.exe"), "/add-driver \"" + Path.Combine(extract, "*.inf") + "\" /subdirs /install");
-                    switch (code)
-                    {
-                        case 0: return InstallOutcome.Of(true, "Installed");
-                        case 3010: return InstallOutcome.Of(true, "Installed", true);
-                        case 259: return InstallOutcome.Of(false, "Windows kept current driver");
-                        default: return InstallOutcome.Of(false, "Failed (pnputil " + code + ")");
-                    }
+                    return PnputilOutcome(Sys.Run(Sys.SystemTool("pnputil.exe"), "/add-driver \"" + Path.Combine(extract, "*.inf") + "\" /subdirs /install"));
                 }
+                // only an installer with a known name - never just any program that happens to be in the package
                 launch = new[] { "AsusSetup.exe", "Setup.exe", "Install.exe", "Installer.exe" }
-                    .Select(n => Directory.GetFiles(extract, n, SearchOption.AllDirectories).FirstOrDefault()).FirstOrDefault(f => f != null)
-                    ?? Directory.GetFiles(extract, "*.exe", SearchOption.AllDirectories).FirstOrDefault();
+                    .Select(n => Directory.GetFiles(extract, n, SearchOption.AllDirectories).FirstOrDefault()).FirstOrDefault(f => f != null);
                 if (launch == null) return InstallOutcome.Of(false, "Package has no installer");
             }
             else if (file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
@@ -477,10 +476,51 @@ namespace DriverUpdater
             return result;
         }
 
+        /// <summary>Notes what's inside a package, to improve silent installs for it later.</summary>
+        static void LogPackage(string extract)
+        {
+            try
+            {
+                var files = Directory.GetFiles(extract, "*", SearchOption.AllDirectories);
+                Log.Write("Package contents (" + files.Length + " files): " + string.Join(", ", files.Where(f => Regex.IsMatch(f, @"\.(exe|inf|ini|msi|bat|cmd|appx|msix|msixbundle)$", RegexOptions.IgnoreCase))
+                    .Take(25).Select(f => f.Substring(extract.Length).TrimStart('\\'))));
+                var ini = files.FirstOrDefault(f => Path.GetFileName(f).Equals("AsusSetup.ini", StringComparison.OrdinalIgnoreCase));
+                if (ini != null && new FileInfo(ini).Length < 8192) Log.Write("AsusSetup.ini:" + Environment.NewLine + File.ReadAllText(ini));
+            }
+            catch { }
+        }
+
+        /// <summary>What "pnputil /add-driver ... /install" exit codes mean.</summary>
+        public static InstallOutcome PnputilOutcome(int code)
+        {
+            switch (code)
+            {
+                case 0: return InstallOutcome.Of(true, "Installed");
+                case 3010: return InstallOutcome.Of(true, "Installed", true);
+                case 259: return InstallOutcome.Of(false, "Windows kept current driver");
+                default: return InstallOutcome.Of(false, "Failed (pnputil " + code + ")");
+            }
+        }
+
+        /// <summary>Waits for an installer to finish, showing the time; null when it runs longer than maxMinutes
+        /// (it is then left to finish on its own).</summary>
+        static int? WaitForInstaller(Process p, string label, int maxMinutes, Action<string> status)
+        {
+            var watch = Stopwatch.StartNew();
+            while (!p.WaitForExit(1000))
+            {
+                int sec = (int)watch.Elapsed.TotalSeconds;
+                if (sec % 3 == 0) status(label + " " + sec / 60 + ":" + (sec % 60).ToString("00"));
+                if (watch.Elapsed.TotalMinutes > maxMinutes) { Log.Write(label + " is taking too long; leaving it to finish on its own."); return null; }
+            }
+            return p.ExitCode;
+        }
+
         /// <summary>Documented silent switches for known manufacturer installers (null = no silent mode known).</summary>
         public static string SilentSwitches(string source, string fileName)
         {
             string f = (fileName ?? "").ToLowerInvariant();
+            if (source == "ASUS" && f == "asussetup.exe") return "-s";        // ASUS package launcher: silent mode (no MyASUS / store prompts)
             if (source == "Dell") return "/s";                                          // Dell Update Package: silent, no automatic restart
             if (source == "Intel")
             {
@@ -504,17 +544,10 @@ namespace DriverUpdater
             int code;
             using (var p = Process.Start(psi))
             {
-                var watch = Stopwatch.StartNew();
-                while (!p.WaitForExit(1000))
-                {
-                    int sec = (int)watch.Elapsed.TotalSeconds;
-                    if (sec % 3 == 0)
-                        status(silent
-                            ? "Installing " + job.Name + " (" + job.Source + ", in the background)... " + sec / 60 + ":" + (sec % 60).ToString("00")
-                            : job.Source + "'s installer is open for " + job.Name + " – finish it there, then Driver Updater continues.");
-                    if (watch.Elapsed.TotalMinutes > 30) { Log.Write(job.Source + " installer is taking too long; leaving it to finish."); return InstallOutcome.Of(false, "Still installing - scan again later"); }
-                }
-                code = p.ExitCode;
+                int? exit = WaitForInstaller(p, silent ? "Installing " + job.Name + " (" + job.Source + ", in the background)..."
+                                                       : job.Source + "'s installer is open for " + job.Name + " – finish it there, then Driver Updater continues.", 30, status);
+                if (exit == null) return InstallOutcome.Of(false, "Still installing – scan again later");
+                code = exit.Value;
             }
             string now = Sys.DriverVersionOf(job.Key);
             Log.Write(job.Source + " installer exit code " + code + "; driver version now " + now + " (offered " + job.Latest + ")");
@@ -588,14 +621,9 @@ namespace DriverUpdater
             var psi = new ProcessStartInfo(runFile, "-s -n Display.Driver") { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(runFile) };
             using (var p = Process.Start(psi))
             {
-                var watch = Stopwatch.StartNew();
-                while (!p.WaitForExit(1000))
-                {
-                    int sec = (int)watch.Elapsed.TotalSeconds;
-                    if (sec % 5 == 0) status("Installing the NVIDIA driver (driver only)... " + sec / 60 + ":" + (sec % 60).ToString("00") + " – the screen may flicker");
-                    if (watch.Elapsed.TotalMinutes > 25) { Log.Write("NVIDIA installer is taking too long; leaving it to finish on its own."); return InstallOutcome.Of(false, "Still installing - check again later"); }
-                }
-                code = p.ExitCode;
+                int? exit = WaitForInstaller(p, "Installing the NVIDIA driver (driver only, the screen may flicker)...", 30, status);
+                if (exit == null) return InstallOutcome.Of(false, "Still installing – scan again later");
+                code = exit.Value;
             }
             string now = Sys.DriverVersionOf(job.Key);
             Log.Write("NVIDIA installer exit code " + code + "; driver version now " + now + " (wanted " + job.Latest + ")");

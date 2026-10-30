@@ -73,6 +73,7 @@ namespace DriverUpdater
             CloseRunningCopies();
 
             step("Copying files...");
+            Paths.SecureStateDir();
             Directory.CreateDirectory(dir);
             string exe = Path.Combine(dir, "DriverUpdater.exe");
             string self = Process.GetCurrentProcess().MainModule.FileName;

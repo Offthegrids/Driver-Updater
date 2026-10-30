@@ -154,6 +154,7 @@ namespace DriverUpdater
                 }
                 if (args.Length > 0 && args[0].Equals("/update", StringComparison.OrdinalIgnoreCase)) return FinishSelfUpdate(args);
                 if (Path.GetFileName(self).StartsWith("DriverUpdaterSetup", StringComparison.OrdinalIgnoreCase)) { Settings.ApplyTheme(); new SetupWindow().Show(); return 0; }
+                Paths.SecureStateDir();
                 do
                 {
                     Reopen = false;
@@ -466,7 +467,7 @@ namespace DriverUpdater
 
         void UpdateHeader()
         {
-            int nUpd = list.Count("Update", "Queued", "Installing", "Opened");
+            int nUpd = list.Count("Update", "Queued", "Installing");
             int nOk = list.Count("Ok", "Installed", "Kept", "NotFor", "Reinstalled");
             int nMk = list.Count("Vendor", "Foreign");
             int nUnk = list.Count("Unknown");
@@ -788,15 +789,15 @@ namespace DriverUpdater
             if (nUnk == 0) { recheckAttempts = 0; return; }
             if (recheckAttempts >= 4)
             {
-                Footer("Microsoft's catalog is still limiting searches, so " + Util.Plural(nUnk, "driver") + " couldn't be checked. Try 'Scan again' later.");
+                Footer("Microsoft's catalog still isn't answering, so " + Util.Plural(nUnk, "driver") + " couldn't be checked. Check the internet connection, then click 'Scan again'.");
                 return;
             }
             DateTime due = CatalogClient.BusyUntil;
             DateTime soonest = DateTime.Now.AddMinutes(recheckAttempts == 0 ? 2 : 5 * recheckAttempts);
             if (due < soonest) due = soonest;
             int round = ++recheckRound;
-            Footer("Microsoft's catalog is limiting searches. " + Util.Plural(nUnk, "driver") + " will be checked again automatically at " +
-                   due.ToString("HH:mm", CultureInfo.InvariantCulture) + " – you can keep using the app or close it.");
+            Footer("Microsoft's catalog didn't answer for " + Util.Plural(nUnk, "driver") + " (busy, or no connection). They will be checked again automatically at " +
+                   due.ToString("HH:mm", CultureInfo.InvariantCulture) + " – keep Driver Updater open for that.");
             Log.Write("Re-check of " + nUnk + " unchecked driver(s) scheduled for " + due.ToString("HH:mm", CultureInfo.InvariantCulture));
             new Thread(() =>
             {
@@ -921,6 +922,7 @@ namespace DriverUpdater
                     }
                     catch (Exception ex) { prefetchErrors[pj.Key] = ex.Message; Log.Write("Download failed for " + pj.Name + ": " + ex.Message); }
                 }
+                WindowsUpdate.Batch wu = null;       // searched once, only if a Windows Update driver is being installed
                 foreach (var j in jobs)
                 {
                     var job = j;
@@ -940,17 +942,18 @@ namespace DriverUpdater
                         if (job.Source == "Windows Update")
                         {
                             say("Downloading and installing: " + job.Name);
-                            var t = WindowsUpdate.Install(job.Ref); res = InstallOutcome.Of(t.Item1, t.Item2, t.Item3);
+                            if (wu == null) wu = WindowsUpdate.Prepare();
+                            var t = WindowsUpdate.Install(wu, job.Ref); res = InstallOutcome.Of(t.Item1, t.Item2, t.Item3);
                         }
                         else if (job.Source == "Microsoft Update Catalog")
                         {
-                            var t = CatalogClient.Install(job.Ref, job.Name, say); res = InstallOutcome.Of(t.Item1, t.Item2, t.Item3);
+                            res = CatalogClient.Install(job.Ref, job.Name, say);
                         }
                         else res = VendorNet.Install(job, say);
                     }
                     catch (Exception ex) { Log.Write("Install failed for " + job.Name + ": " + ex); res = InstallOutcome.Of(false, "Failed: " + ex.Message); }
                     // Did Windows actually start using it? If not (and no restart is pending), Windows prefers the current driver.
-                    if (res.Ok && !res.Reboot && !res.Opened)
+                    if (res.Ok && !res.Reboot)
                     {
                         var now = Util.ParseVersion(Sys.DriverVersionOf(job.Key));
                         var want = Util.ParseVersion(job.Latest);
@@ -988,18 +991,14 @@ namespace DriverUpdater
             E("InstallProgress").Visibility = Wpf.VisName("Hidden");
             mode = "scanned";
             SetBusy(false);
-            int ok = 0, fail = 0, opened = 0;
+            int ok = 0, fail = 0;
             var needRestart = new List<DriverItem>();
             foreach (var t in targets)
             {
                 var d = list.Data[t.Key];
                 InstallOutcome r;
-                if (results.TryGetValue(t.Key, out r) && r.Opened)
-                {
-                    opened++;
-                    t.ApplyState("Opened", d, false);
-                }
-                else if (r != null && r.Ok)
+                results.TryGetValue(t.Key, out r);
+                if (r != null && r.Ok)
                 {
                     ok++;
                     d.Reboot = r.Reboot;
@@ -1015,6 +1014,7 @@ namespace DriverUpdater
                 }
                 else if (r != null && r.Kept)
                 {
+                    KeptStore.Add(t.Key, d.Latest);      // don't offer the same version again next scan
                     d.Kind = "Kept";
                     t.ApplyState("Kept", d, false);
                 }
@@ -1028,7 +1028,7 @@ namespace DriverUpdater
             }
             UpdateHeader();
             if (lastScan.HasValue) ScanStore.Save(lastScan.Value, list.Data.Values);
-            string msg = ok + " installed, " + fail + " not installed" + (opened > 0 ? ", " + Util.Plural(opened, "manufacturer installer") + " opened" : "") + ". Details are in the log (Tools > Open log folder).";
+            string msg = ok + " installed, " + fail + " not installed. Details are in the log (Tools > Open log folder).";
             if (needRestart.Count > 0) msg += " " + needRestart.Count + (needRestart.Count == 1 ? " needs" : " need") + " a restart to finish.";
             Footer(msg);
             if (needRestart.Count > 0)
@@ -1038,9 +1038,7 @@ namespace DriverUpdater
                     "\n\nThe old driver keeps working until then. Restart now?\n(Choose No to restart later yourself.)", "Driver Updater", Native.YESNO, Native.QUESTION) == Native.IDYES)
                     Sys.Restart();
             }
-            else Native.Ask(Util.Plural(ok, "driver") + " installed, " + fail + " not installed." +
-                (opened > 0 ? "\n\n" + Util.Plural(opened, "manufacturer installer") + " opened in their own window. Follow the steps there to finish, then click 'Scan again'." : ""),
-                "Driver Updater", Native.OK, Native.INFO);
+            else Native.Ask(Util.Plural(ok, "driver") + " installed, " + fail + " not installed.", "Driver Updater", Native.OK, Native.INFO);
         }
 
         // ---------------------------------------------------------------- manufacturer tools
@@ -1119,7 +1117,7 @@ namespace DriverUpdater
 
         static readonly Dictionary<string, string[]> FilterStates = new Dictionary<string, string[]>
         {
-            { "Upd", new[] { "Update", "Queued", "Installing", "Opened" } },
+            { "Upd", new[] { "Update", "Queued", "Installing" } },
             { "Ok", new[] { "Ok", "Installed", "Kept", "NotFor", "Reinstalled" } },
             { "Mk", new[] { "Vendor", "Foreign" } },
             { "Unk", new[] { "Unknown" } },
@@ -1241,7 +1239,14 @@ namespace DriverUpdater
             Run(() =>
             {
                 string file = null, error = null;
-                try { file = SelfUpdate.Download(r, pct => Post(() => E("UpdateBannerText").Text = "Downloading Driver Updater " + r.Version + "...  " + pct + "%")); }
+                try
+                {
+                    // never trust the saved copy for this step: ask GitHub again for the release and its fingerprint
+                    var fresh = SelfUpdate.Check(true);
+                    if (fresh == null || fresh.Version != r.Version) throw new InvalidOperationException("GitHub no longer offers version " + r.Version);
+                    r = fresh;
+                    file = SelfUpdate.Download(r, pct => Post(() => E("UpdateBannerText").Text = "Downloading Driver Updater " + r.Version + "...  " + pct + "%"));
+                }
                 catch (Exception ex) { error = ex.Message; Log.Write("App update download failed: " + ex); }
                 Post(() =>
                 {
@@ -1276,9 +1281,14 @@ namespace DriverUpdater
         // ---------------------------------------------------------------- drivers made for another PC maker
         void StartRestoreInbox(DriverItem item)
         {
+            var others = InboxRestore.OtherDevicesUsingDriver(item.Key);
+            string alsoText = others.Count == 0 ? "" :
+                "\n\nThe same driver is also used by:\n" + string.Join("\n", others.Take(8).Select(n => "  • " + n)) +
+                (others.Count > 8 ? "\n  • and " + (others.Count - 8) + " more" : "") + "\nThey will switch to Windows' own drivers too.";
             if (Native.Ask(item.Name + " uses a driver made for " + item.Foreign + " PCs (version " + item.Installed + "). It was probably installed by another driver tool.\n\n" +
-                           "Remove it so Windows goes back to its own driver for this device?\n\nA System Restore point is created first. The device may stop for a moment, and a restart may be needed.",
-                           "Use Windows driver", Native.YESNO, Native.QUESTION) != Native.IDYES) return;
+                           "Remove it so Windows goes back to its own driver for this device?" + alsoText +
+                           "\n\nA System Restore point is created first. The device may stop for a moment, and a restart may be needed.",
+                           "Use Windows driver", Native.YESNO, others.Count > 0 ? Native.WARNING : Native.QUESTION) != Native.IDYES) return;
             string prev = mode;
             mode = "installing";
             item.SetTag("Restoring Windows driver...", "#DBEAFE", "#1D4ED8");
