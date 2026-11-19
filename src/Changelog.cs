@@ -17,6 +17,15 @@ namespace DriverUpdater
     {
         static readonly string[][] Raw =
         {
+            new[] { "3.7.6", "30 Oct 2026",
+                "Fixed: Some ASUS updates (like ASUS System Control Interface) opened ASUS's installer and asked to install MyASUS – they now install silently",
+                "Security: The app's saved data folder can only be changed by administrators, and updates to Driver Updater always re-check GitHub before installing",
+                "Fixed: Without an internet connection, drivers showed 'Microsoft busy' and Microsoft's catalog was paused for 8 minutes",
+                "Fixed: A Dell update that Dell's installer reported as already in place was offered again on the next scan",
+                "Fixed: A manufacturer package without a recognised installer could run another program from the package – it's now refused",
+                "Improved: 'Use Windows driver' lists other devices that share the same driver before removing it",
+                "Improved: Installing several Windows Update drivers is faster (Windows Update is searched once, not once per driver)",
+                "Improved: The log file no longer grows forever" },
             new[] { "3.7.5", "30 Oct 2026",
                 "Fixed: 3.7.4 closed with an error as soon as it opened" },
             new[] { "3.7.4", "30 Oct 2026",

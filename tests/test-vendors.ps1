@@ -75,12 +75,11 @@ function SR($k,$v,$src) { $r=[DriverUpdater.ScanResult]::new(); $r.Key=$k;$r.Nam
 [void]$L.AddResult((SR 'g' '32.0.101.8900' 'Windows Update'), $true)
 [void]$L.AddResult((SR 'g' '32.0.101.9034' 'Intel'), $true)
 Check 'better result replaces, row not moved twice' ($L.TopCount -eq 1 -and $L.Rows[0].Key -eq 'g' -and $L.Rows[0].Source -like 'Official  |  Intel*')
-$L.Rows[0].ApplyState('Opened', (SR 'g' '32.0.101.9034' 'NVIDIA'), $false)
-Check 'opened state' ($L.Rows[0].TagText -eq 'NVIDIA installer opened – finish there')
 ""; if ($fail) { "$fail FAILED" } else { 'ALL PASSED' }
 "Silent switches"
 Check 'intel graphics' ([DriverUpdater.VendorNet]::SilentSwitches('Intel','gfx_win_101.9150.exe') -eq '-s --overwrite --noExtras')
 Check 'intel wifi' ([DriverUpdater.VendorNet]::SilentSwitches('Intel','WiFi-24.70.0-Driver64-Win10-Win11.exe') -eq '-q -s')
 Check 'intel npu' ([DriverUpdater.VendorNet]::SilentSwitches('Intel','npu_win_32.0.100.5540.exe') -eq '-s')
-Check 'unknown -> interactive' ($null -eq [DriverUpdater.VendorNet]::SilentSwitches('ASUS','AsusSetup.exe'))
+Check 'unknown -> interactive' ($null -eq [DriverUpdater.VendorNet]::SilentSwitches('ASUS','Setup.exe'))
+Check 'ASUS package launcher silent' ([DriverUpdater.VendorNet]::SilentSwitches('ASUS','AsusSetup.exe') -eq '-s')
 ""; if ($fail) { "$fail FAILED" } else { 'ALL PASSED (with switches)' }

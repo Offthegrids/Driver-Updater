@@ -493,7 +493,7 @@ namespace DriverUpdater
                     SetTag("Check with maker", "#EFF6FF", "#1D4ED8");
                     if (hint.Length > 0) { Size = "Newer builds: " + hint; ButtonText = "Maker's tool"; ButtonTag = "Maker"; ButtonVisibility = "Visible"; }
                     break;
-                case "Unknown": SetTag("Not checked – Microsoft busy", "#FEF3C7", "#B45309"); break;
+                case "Unknown": SetTag("Not checked – Microsoft didn't answer", "#FEF3C7", "#B45309"); break;
                 case "NotFor":
                     SetTag("Up to date", "#DCFCE7", "#15803D");
                     if (r != null) Size = r.Source + "'s " + r.Latest + " package doesn't support this device";
@@ -509,10 +509,6 @@ namespace DriverUpdater
                 case "Installing":
                     ApplyState("Update", r, busy);
                     State = "Installing"; SetTag("Installing...", "#DBEAFE", "#1D4ED8"); SpinVisibility = "Visible"; ButtonEnabled = false;
-                    break;
-                case "Opened":
-                    ApplyState("Update", r, busy);
-                    State = "Opened"; SetTag(r.Source + " installer opened – finish there", "#FEF3C7", "#B45309");
                     break;
                 case "Installed":
                     if (r != null && r.Reboot) SetTag("Installed – restart to finish", "#FEF3C7", "#B45309");

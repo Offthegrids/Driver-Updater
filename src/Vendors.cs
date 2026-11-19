@@ -510,6 +510,25 @@ namespace DriverUpdater
             return n(a) > n(b);
         }
 
+        /// <summary>The last check before a downloaded update is run as administrator: null when the file is
+        /// exactly this release (size, GitHub's SHA-256 fingerprint, version), otherwise why it isn't.</summary>
+        public static string Verify(string file, AppRelease r, string runningVersion, string fileVersion)
+        {
+            long len = new System.IO.FileInfo(file).Length;
+            if (r.Size > 0 && len != r.Size) return "The download is incomplete (" + len + " of " + r.Size + " bytes)";
+            if (!string.IsNullOrEmpty(r.Digest))
+            {
+                if (!r.Digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)) return "Unknown fingerprint type (" + r.Digest + ")";
+                string have;
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                using (var fs = System.IO.File.OpenRead(file)) have = BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "");
+                if (!string.Equals(have, r.Digest.Substring(7).Trim(), StringComparison.OrdinalIgnoreCase)) return "The download doesn't match the published file (fingerprint mismatch)";
+            }
+            bool same = !IsNewer(fileVersion, r.Version) && !IsNewer(r.Version, fileVersion) && Util.ParseVersion(fileVersion) != null;
+            if (!same || !IsNewer(fileVersion, runningVersion)) return "The downloaded file isn't Driver Updater " + r.Version;
+            return null;
+        }
+
         /// <summary>Release notes as plain text for a message box.</summary>
         public static string PlainNotes(string md, int max = 1200)
         {

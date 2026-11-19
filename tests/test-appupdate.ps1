@@ -21,4 +21,16 @@ Check 'older is not newer' (-not [DriverUpdater.AppRelease]::IsNewer('3.4.2', '3
 Check 'file version newer' ([DriverUpdater.AppRelease]::IsNewer('3.6.0.0', '3.5.3'))
 $n = [DriverUpdater.AppRelease]::PlainNotes($r.Notes)
 Check 'plain notes' ($n -like "What's new*" -and $n -like "*$([char]0x2022) Update banner when*" -and $n -notlike '*https*' -and $n -notlike '*`*`**')
+"Downloaded update check"
+$tmp = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($tmp, 'pretend installer')
+$sha = (Get-FileHash $tmp -Algorithm SHA256).Hash
+$ok = [DriverUpdater.AppRelease]::new(); $ok.Version = '3.8.0'; $ok.Size = (Get-Item $tmp).Length; $ok.Digest = 'sha256:' + $sha.ToLower()
+Check 'right file accepted' ($null -eq [DriverUpdater.AppRelease]::Verify($tmp, $ok, '3.7.6', '3.8.0.0'))
+$bad = [DriverUpdater.AppRelease]::new(); $bad.Version = '3.8.0'; $bad.Size = $ok.Size; $bad.Digest = 'sha256:' + ('0' * 64)
+Check 'wrong fingerprint refused' ([DriverUpdater.AppRelease]::Verify($tmp, $bad, '3.7.6', '3.8.0.0') -like '*fingerprint*')
+$short = [DriverUpdater.AppRelease]::new(); $short.Version = '3.8.0'; $short.Size = $ok.Size + 1
+Check 'wrong size refused' ([DriverUpdater.AppRelease]::Verify($tmp, $short, '3.7.6', '3.8.0.0') -like '*incomplete*')
+Check 'other version refused' ([DriverUpdater.AppRelease]::Verify($tmp, $ok, '3.7.6', '3.8.10.0') -like "*isn't Driver Updater*")
+Check 'not newer than running refused' ([DriverUpdater.AppRelease]::Verify($tmp, $ok, '3.8.0', '3.8.0.0') -like "*isn't Driver Updater*")
+Remove-Item $tmp
 if ($fail) { exit 1 }
